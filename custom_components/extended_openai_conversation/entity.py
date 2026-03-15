@@ -20,6 +20,7 @@ from voluptuous_openapi import convert
 
 from homeassistant.components import conversation
 from homeassistant.config_entries import ConfigSubentry
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, llm
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import slugify
@@ -218,6 +219,52 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             for func_spec in function_tools
         ]
 
+        # Merge LLM API tools (e.g., from mcp_client) if available
+        llm_api_tools: dict[str, llm.Tool] = {}
+        yaml_tool_names = {f["spec"]["name"] for f in function_tools}
+        if chat_log.llm_api and chat_log.llm_api.tools:
+            for llm_tool in chat_log.llm_api.tools:
+                # YAML tools take priority — skip LLM API tools with same name
+                if llm_tool.name in yaml_tool_names:
+                    _LOGGER.debug(
+                        "Skipping LLM API tool '%s' (overridden by YAML)",
+                        llm_tool.name,
+                    )
+                    continue
+                try:
+                    tool_schema = convert(
+                        llm_tool.parameters,
+                        custom_serializer=(
+                            chat_log.llm_api.custom_serializer
+                            if chat_log.llm_api
+                            else llm.selector_serializer
+                        ),
+                    )
+                    _adjust_schema(tool_schema)
+                    tools.append(
+                        ChatCompletionToolParam(
+                            type="function",
+                            function={
+                                "name": llm_tool.name,
+                                "description": llm_tool.description or "",
+                                "parameters": tool_schema,
+                            },
+                        )
+                    )
+                    llm_api_tools[llm_tool.name] = llm_tool
+                except Exception:
+                    _LOGGER.warning(
+                        "Failed to convert LLM API tool '%s', skipping",
+                        llm_tool.name,
+                        exc_info=True,
+                    )
+            if llm_api_tools:
+                _LOGGER.info(
+                    "Added %d LLM API tools: %s",
+                    len(llm_api_tools),
+                    list(llm_api_tools.keys()),
+                )
+
         # Build API parameters based on model configuration
         api_kwargs: dict[str, Any] = {
             "model": model,
@@ -303,6 +350,7 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
 
             # Execute custom functions
             for tool_input in pending_tool_calls:
+                # Check YAML function tools first (user-defined take priority)
                 function_tool = next(
                     (
                         f
@@ -312,15 +360,21 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     None,
                 )
 
-                if function_tool is None:
+                if function_tool is not None:
+                    tool_result_content = await self._execute_function_tool(
+                        function_tool,
+                        tool_input,
+                        llm_context,
+                        exposed_entities,
+                    )
+                elif tool_input.tool_name in llm_api_tools:
+                    tool_result_content = await self._execute_llm_api_tool(
+                        llm_api_tools[tool_input.tool_name],
+                        tool_input,
+                        llm_context,
+                    )
+                else:
                     raise FunctionNotFound(tool_input.tool_name)
-
-                tool_result_content = await self._execute_function_tool(
-                    function_tool,
-                    tool_input,
-                    llm_context,
-                    exposed_entities,
-                )
 
                 chat_log.async_add_assistant_content_without_tools(tool_result_content)
 
@@ -470,6 +524,34 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             tool_call_id=tool_input.id,
             tool_name=tool_input.tool_name,
             tool_result={"result": str(result)},
+        )
+
+    async def _execute_llm_api_tool(
+        self,
+        tool: llm.Tool,
+        tool_input: llm.ToolInput,
+        llm_context: llm.LLMContext | None,
+    ) -> conversation.ToolResultContent:
+        """Execute an LLM API tool (e.g., MCP tool from mcp_client)."""
+        _LOGGER.info("Executing LLM API tool: %s", tool_input.tool_name)
+        try:
+            result = await tool.async_call(self.hass, tool_input, llm_context)
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "LLM API tool '%s' failed: %s", tool_input.tool_name, err
+            )
+            result = {"error": str(err)}
+
+        # Truncate large results to prevent context window blowout
+        result_str = str(result.get("result", result))
+        if len(result_str) > 10000:
+            result_str = result_str[:10000] + "... (truncated)"
+
+        return conversation.ToolResultContent(
+            agent_id=self.entity_id,
+            tool_call_id=tool_input.id,
+            tool_name=tool_input.tool_name,
+            tool_result={"result": result_str},
         )
 
     def should_run_in_background(self, arguments: dict[str, Any]) -> bool:
