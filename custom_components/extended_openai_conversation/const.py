@@ -245,11 +245,15 @@ CONF_REASONING_EFFORT = "reasoning_effort"
 DEFAULT_REASONING_EFFORT = "low"
 REASONING_EFFORT_OPTIONS = ["low", "medium", "high"]
 
-# Connection retry settings
+# Connection retry settings.
+# On failure, the integration retries with exponential backoff on top of
+# the OpenAI SDK's own internal retries (3 attempts).  The default
+# schedule (3 × {1s, 2s, 4s}) provides up to 9 HTTP-level attempts over
+# ~15 seconds, covering typical server restart windows.
 DEFAULT_RETRY_MAX_ATTEMPTS = 3
-DEFAULT_RETRY_INITIAL_DELAY = 1.0  # seconds
-DEFAULT_RETRY_MAX_DELAY = 10.0  # seconds
-DEFAULT_RETRY_BACKOFF_FACTOR = 2.0
+DEFAULT_RETRY_INITIAL_DELAY = 1.0  # seconds before first retry
+DEFAULT_RETRY_MAX_DELAY = 10.0  # cap for any single retry delay
+DEFAULT_RETRY_BACKOFF_FACTOR = 2.0  # multiplier per successive retry
 
 SERVICE_QUERY_IMAGE = "query_image"
 

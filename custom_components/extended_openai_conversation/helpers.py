@@ -10,7 +10,6 @@ import re
 from typing import Any
 
 from openai import AsyncAzureOpenAI, AsyncClient, AsyncOpenAI, OpenAIError
-from openai._exceptions import APIConnectionError
 
 from homeassistant.components import conversation
 from homeassistant.components.homeassistant.exposed_entities import async_should_expose
@@ -183,12 +182,22 @@ async def ensure_client_healthy(
     hass: HomeAssistant,
     entry: ConfigEntry,
 ) -> None:
-    """Ensure the OpenAI client is healthy, recreating if necessary.
+    """Ensure the OpenAI client is usable, recreating it if the connection is closed.
 
-    Checks if the underlying httpx client is closed and recreates
-    the OpenAI client if needed, updating entry.runtime_data.
+    The OpenAI SDK wraps an httpx.AsyncClient for HTTP communication. If that
+    underlying client has been closed (e.g., after a server restart or network
+    interruption), subsequent requests will fail immediately. This function
+    detects that state and transparently recreates the client so the caller
+    does not need a manual integration reload.
+
+    The new client is stored in ``entry.runtime_data``, which is read by
+    ``ExtendedOpenAIBaseLLMEntity._client`` on every access, so all entities
+    pick up the replacement automatically.
     """
     client: AsyncClient = entry.runtime_data
+
+    # The OpenAI SDK exposes ``is_closed()`` as a method on the public client.
+    # Fall back to checking the internal httpx client attribute if needed.
     if hasattr(client, "is_closed") and callable(client.is_closed):
         closed = client.is_closed()
     elif hasattr(client, "_client") and hasattr(client._client, "is_closed"):
@@ -196,18 +205,19 @@ async def ensure_client_healthy(
     else:
         closed = False
 
-    if closed:
-        _LOGGER.warning("OpenAI client connection is closed, recreating client")
-        new_client = await get_authenticated_client(
-            hass=hass,
-            api_key=entry.data[CONF_API_KEY],
-            base_url=entry.data.get(CONF_BASE_URL),
-            api_version=entry.data.get(CONF_API_VERSION),
-            organization=entry.data.get(CONF_ORGANIZATION),
-            skip_authentication=True,
-            api_provider=entry.data.get(CONF_API_PROVIDER, DEFAULT_API_PROVIDER),
-        )
-        entry.runtime_data = new_client
+    if not closed:
+        return
+
+    _LOGGER.warning("OpenAI client connection is closed, recreating client")
+    entry.runtime_data = await get_authenticated_client(
+        hass=hass,
+        api_key=entry.data[CONF_API_KEY],
+        base_url=entry.data.get(CONF_BASE_URL),
+        api_version=entry.data.get(CONF_API_VERSION),
+        organization=entry.data.get(CONF_ORGANIZATION),
+        skip_authentication=True,
+        api_provider=entry.data.get(CONF_API_PROVIDER, DEFAULT_API_PROVIDER),
+    )
 
 
 async def retry_with_backoff(
@@ -219,10 +229,20 @@ async def retry_with_backoff(
     max_delay: float = DEFAULT_RETRY_MAX_DELAY,
     backoff_factor: float = DEFAULT_RETRY_BACKOFF_FACTOR,
 ) -> None:
-    """Execute an async callable with exponential backoff on OpenAI errors.
+    """Execute an async operation with exponential backoff on OpenAI errors.
 
-    Before each retry, ensures the OpenAI client is healthy.
-    Raises the last OpenAIError if all attempts fail.
+    Wraps a coroutine factory (a zero-argument callable that returns a
+    coroutine) and retries it on ``OpenAIError`` with increasing delays.
+    Before each attempt the client health is verified via
+    :func:`ensure_client_healthy`.
+
+    The default schedule (3 attempts with delays of 1 s, 2 s) adds no
+    latency to successful requests — the retry path only activates on
+    failure. Combined with the OpenAI SDK's own internal retries (3
+    attempts with sub-second backoff), this provides up to 9 HTTP-level
+    attempts over ~15 seconds, covering typical server restart windows.
+
+    Raises the last ``OpenAIError`` if all attempts are exhausted.
     """
     last_error: OpenAIError | None = None
 
@@ -250,7 +270,7 @@ async def retry_with_backoff(
                 await asyncio.sleep(delay)
             else:
                 _LOGGER.error(
-                    "All %d OpenAI request attempts failed. Last error: %s",
+                    "All %d OpenAI request attempts failed: %s",
                     max_attempts,
                     err,
                 )

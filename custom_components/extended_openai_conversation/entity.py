@@ -219,85 +219,25 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             for func_spec in function_tools
         ]
 
-        # Discover and merge LLM API tools (e.g., from mcp_client)
+        # Discover and merge tools registered via Home Assistant's LLM API.
+        #
+        # Other integrations (e.g., mcp_client) register tool providers with
+        # ``llm.async_register_api()``.  We query all registered APIs, convert
+        # their tool schemas to the OpenAI function-calling format, and append
+        # them to the tools list.  YAML-defined tools take priority: if a YAML
+        # tool and an LLM API tool share the same name, the LLM API tool is
+        # skipped.  Tool execution is routed in the dispatch loop below.
         llm_api_tools: dict[str, llm.Tool] = {}
         yaml_tool_names = {f["spec"]["name"] for f in function_tools}
+
         try:
-            registered_apis = llm.async_get_apis(self.hass)
-            for api in registered_apis:
-                # Skip the built-in Assist API — we use our own YAML tools
-                if api.id == "assist":
-                    continue
-                try:
-                    api_instance = await api.async_get_api_instance(
-                        llm_context or llm.LLMContext(
-                            platform=DOMAIN,
-                            context=None,
-                            user_prompt=None,
-                            language="en",
-                            assistant=conversation.DOMAIN,
-                            device_id=None,
-                        )
-                    )
-                except Exception:
-                    _LOGGER.warning(
-                        "Failed to get LLM API instance '%s', skipping",
-                        api.id,
-                        exc_info=True,
-                    )
-                    continue
-                if not api_instance.tools:
-                    continue
-                # Append api_prompt to system prompt if available
-                if api_instance.api_prompt:
-                    chat_log.content[0] = conversation.SystemContent(
-                        content=chat_log.content[0].content
-                        + "\n\n"
-                        + api_instance.api_prompt
-                    )
-                for llm_tool in api_instance.tools:
-                    if llm_tool.name in yaml_tool_names:
-                        _LOGGER.debug(
-                            "Skipping LLM API tool '%s' (overridden by YAML)",
-                            llm_tool.name,
-                        )
-                        continue
-                    try:
-                        tool_schema = convert(
-                            llm_tool.parameters,
-                            custom_serializer=getattr(
-                                api_instance, "custom_serializer",
-                                llm.selector_serializer,
-                            ),
-                        )
-                        _adjust_schema(tool_schema)
-                        tools.append(
-                            ChatCompletionToolParam(
-                                type="function",
-                                function={
-                                    "name": llm_tool.name,
-                                    "description": llm_tool.description or "",
-                                    "parameters": tool_schema,
-                                },
-                            )
-                        )
-                        llm_api_tools[llm_tool.name] = llm_tool
-                    except Exception:
-                        _LOGGER.warning(
-                            "Failed to convert LLM API tool '%s', skipping",
-                            llm_tool.name,
-                            exc_info=True,
-                        )
+            llm_api_tools = await self._discover_llm_api_tools(
+                chat_log, tools, yaml_tool_names, llm_context,
+            )
         except Exception:
             _LOGGER.warning(
                 "Failed to discover LLM API tools, continuing without them",
                 exc_info=True,
-            )
-        if llm_api_tools:
-            _LOGGER.info(
-                "Added %d LLM API tools: %s",
-                len(llm_api_tools),
-                list(llm_api_tools.keys()),
             )
 
         # Build API parameters based on model configuration
@@ -561,13 +501,127 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             tool_result={"result": str(result)},
         )
 
+    async def _discover_llm_api_tools(
+        self,
+        chat_log: conversation.ChatLog,
+        tools: list[ChatCompletionToolParam],
+        yaml_tool_names: set[str],
+        llm_context: llm.LLMContext | None,
+    ) -> dict[str, llm.Tool]:
+        """Discover tools from Home Assistant's LLM API and append them to *tools*.
+
+        Iterates over all APIs registered via ``llm.async_register_api()``
+        (skipping the built-in Assist API), converts each tool's voluptuous
+        schema to JSON Schema via ``voluptuous_openapi.convert()``, and
+        appends them as ``ChatCompletionToolParam`` entries.
+
+        If an API provides an ``api_prompt``, it is appended to the system
+        message so the model knows the tools are available.
+
+        Returns a mapping of tool name → ``llm.Tool`` for use in the
+        execution dispatch loop.
+        """
+        llm_api_tools: dict[str, llm.Tool] = {}
+        fallback_context = llm.LLMContext(
+            platform=DOMAIN,
+            context=None,
+            user_prompt=None,
+            language="en",
+            assistant=conversation.DOMAIN,
+            device_id=None,
+        )
+
+        for api in llm.async_get_apis(self.hass):
+            # The built-in Assist API provides HA intent tools that overlap
+            # with the YAML-defined functions.  Skip it.
+            if api.id == "assist":
+                continue
+
+            try:
+                api_instance = await api.async_get_api_instance(
+                    llm_context or fallback_context
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Failed to get LLM API instance '%s', skipping",
+                    api.id,
+                    exc_info=True,
+                )
+                continue
+
+            if not api_instance.tools:
+                continue
+
+            # Inject the API's descriptive prompt into the system message.
+            if api_instance.api_prompt:
+                chat_log.content[0] = conversation.SystemContent(
+                    content=chat_log.content[0].content
+                    + "\n\n"
+                    + api_instance.api_prompt
+                )
+
+            custom_serializer = getattr(
+                api_instance, "custom_serializer", llm.selector_serializer
+            )
+
+            for llm_tool in api_instance.tools:
+                if llm_tool.name in yaml_tool_names:
+                    _LOGGER.debug(
+                        "Skipping LLM API tool '%s' (overridden by YAML)",
+                        llm_tool.name,
+                    )
+                    continue
+                try:
+                    tool_schema = convert(
+                        llm_tool.parameters,
+                        custom_serializer=custom_serializer,
+                    )
+                    _adjust_schema(tool_schema)
+                    tools.append(
+                        ChatCompletionToolParam(
+                            type="function",
+                            function={
+                                "name": llm_tool.name,
+                                "description": llm_tool.description or "",
+                                "parameters": tool_schema,
+                            },
+                        )
+                    )
+                    llm_api_tools[llm_tool.name] = llm_tool
+                except Exception:
+                    _LOGGER.warning(
+                        "Failed to convert LLM API tool '%s', skipping",
+                        llm_tool.name,
+                        exc_info=True,
+                    )
+
+        if llm_api_tools:
+            _LOGGER.info(
+                "Discovered %d LLM API tools: %s",
+                len(llm_api_tools),
+                list(llm_api_tools.keys()),
+            )
+
+        return llm_api_tools
+
+    # Maximum size (in characters) for tool results returned to the model.
+    # Large results (e.g., from web searches or HA entity dumps) are
+    # truncated to prevent context window exhaustion.
+    _LLM_API_TOOL_RESULT_MAX_LENGTH = 10_000
+
     async def _execute_llm_api_tool(
         self,
         tool: llm.Tool,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext | None,
     ) -> conversation.ToolResultContent:
-        """Execute an LLM API tool (e.g., MCP tool from mcp_client)."""
+        """Execute a tool discovered via Home Assistant's LLM API.
+
+        Calls ``tool.async_call()`` and wraps the result in a
+        ``ToolResultContent``.  Errors are caught and returned as tool
+        results (``{"error": "..."}``), giving the model the opportunity
+        to respond gracefully instead of terminating the conversation.
+        """
         _LOGGER.info("Executing LLM API tool: %s", tool_input.tool_name)
         try:
             result = await tool.async_call(self.hass, tool_input, llm_context)
@@ -577,10 +631,12 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             )
             result = {"error": str(err)}
 
-        # Truncate large results to prevent context window blowout
         result_str = str(result.get("result", result))
-        if len(result_str) > 10000:
-            result_str = result_str[:10000] + "... (truncated)"
+        if len(result_str) > self._LLM_API_TOOL_RESULT_MAX_LENGTH:
+            result_str = (
+                result_str[: self._LLM_API_TOOL_RESULT_MAX_LENGTH]
+                + "... (truncated)"
+            )
 
         return conversation.ToolResultContent(
             agent_id=self.entity_id,
