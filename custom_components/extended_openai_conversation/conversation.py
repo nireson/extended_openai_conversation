@@ -128,7 +128,7 @@ class ExtendedOpenAIAgentEntity(
 
         # Build custom prompt with exposed entities
         system_prompt = self._build_system_prompt(
-            exposed_entities, llm_context, user_input, chat_log
+            exposed_entities, llm_context, user_input
         )
 
         # Set system prompt in chat log
@@ -195,7 +195,6 @@ class ExtendedOpenAIAgentEntity(
         exposed_entities: list[dict],
         llm_context: llm.LLMContext,
         user_input: ConversationInput,
-        chat_log: ChatLog | None = None,
     ) -> str:
         """Build system prompt with exposed entities and skills."""
         raw_prompt: str = self.subentry.data.get(CONF_PROMPT, DEFAULT_PROMPT)
@@ -210,10 +209,6 @@ class ExtendedOpenAIAgentEntity(
             },
             parse_result=False,
         )
-
-        # Append LLM API prompt if available (e.g., MCP tools context)
-        if chat_log and chat_log.llm_api and chat_log.llm_api.api_prompt:
-            result = str(result) + "\n\n" + chat_log.llm_api.api_prompt
 
         return str(result)
 

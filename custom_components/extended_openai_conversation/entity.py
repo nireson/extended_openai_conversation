@@ -219,51 +219,86 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             for func_spec in function_tools
         ]
 
-        # Merge LLM API tools (e.g., from mcp_client) if available
+        # Discover and merge LLM API tools (e.g., from mcp_client)
         llm_api_tools: dict[str, llm.Tool] = {}
         yaml_tool_names = {f["spec"]["name"] for f in function_tools}
-        if chat_log.llm_api and chat_log.llm_api.tools:
-            for llm_tool in chat_log.llm_api.tools:
-                # YAML tools take priority — skip LLM API tools with same name
-                if llm_tool.name in yaml_tool_names:
-                    _LOGGER.debug(
-                        "Skipping LLM API tool '%s' (overridden by YAML)",
-                        llm_tool.name,
-                    )
+        try:
+            registered_apis = llm.async_get_apis(self.hass)
+            for api in registered_apis:
+                # Skip the built-in Assist API — we use our own YAML tools
+                if api.id == "assist":
                     continue
                 try:
-                    tool_schema = convert(
-                        llm_tool.parameters,
-                        custom_serializer=(
-                            chat_log.llm_api.custom_serializer
-                            if chat_log.llm_api
-                            else llm.selector_serializer
-                        ),
-                    )
-                    _adjust_schema(tool_schema)
-                    tools.append(
-                        ChatCompletionToolParam(
-                            type="function",
-                            function={
-                                "name": llm_tool.name,
-                                "description": llm_tool.description or "",
-                                "parameters": tool_schema,
-                            },
+                    api_instance = await api.async_get_api_instance(
+                        llm_context or llm.LLMContext(
+                            platform=DOMAIN,
+                            context=None,
+                            user_prompt=None,
+                            language="en",
+                            assistant=conversation.DOMAIN,
+                            device_id=None,
                         )
                     )
-                    llm_api_tools[llm_tool.name] = llm_tool
                 except Exception:
                     _LOGGER.warning(
-                        "Failed to convert LLM API tool '%s', skipping",
-                        llm_tool.name,
+                        "Failed to get LLM API instance '%s', skipping",
+                        api.id,
                         exc_info=True,
                     )
-            if llm_api_tools:
-                _LOGGER.info(
-                    "Added %d LLM API tools: %s",
-                    len(llm_api_tools),
-                    list(llm_api_tools.keys()),
-                )
+                    continue
+                if not api_instance.tools:
+                    continue
+                # Append api_prompt to system prompt if available
+                if api_instance.api_prompt:
+                    chat_log.content[0] = conversation.SystemContent(
+                        content=chat_log.content[0].content
+                        + "\n\n"
+                        + api_instance.api_prompt
+                    )
+                for llm_tool in api_instance.tools:
+                    if llm_tool.name in yaml_tool_names:
+                        _LOGGER.debug(
+                            "Skipping LLM API tool '%s' (overridden by YAML)",
+                            llm_tool.name,
+                        )
+                        continue
+                    try:
+                        tool_schema = convert(
+                            llm_tool.parameters,
+                            custom_serializer=getattr(
+                                api_instance, "custom_serializer",
+                                llm.selector_serializer,
+                            ),
+                        )
+                        _adjust_schema(tool_schema)
+                        tools.append(
+                            ChatCompletionToolParam(
+                                type="function",
+                                function={
+                                    "name": llm_tool.name,
+                                    "description": llm_tool.description or "",
+                                    "parameters": tool_schema,
+                                },
+                            )
+                        )
+                        llm_api_tools[llm_tool.name] = llm_tool
+                    except Exception:
+                        _LOGGER.warning(
+                            "Failed to convert LLM API tool '%s', skipping",
+                            llm_tool.name,
+                            exc_info=True,
+                        )
+        except Exception:
+            _LOGGER.warning(
+                "Failed to discover LLM API tools, continuing without them",
+                exc_info=True,
+            )
+        if llm_api_tools:
+            _LOGGER.info(
+                "Added %d LLM API tools: %s",
+                len(llm_api_tools),
+                list(llm_api_tools.keys()),
+            )
 
         # Build API parameters based on model configuration
         api_kwargs: dict[str, Any] = {
