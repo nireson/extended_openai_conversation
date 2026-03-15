@@ -39,7 +39,7 @@ from .const import (
 from .entity import ExtendedOpenAIBaseLLMEntity
 from .exceptions import FunctionLoadFailed, FunctionNotFound, InvalidFunction
 from .functions import get_function
-from .helpers import get_exposed_entities
+from .helpers import get_exposed_entities, retry_with_backoff
 from .skills import Skill, SkillManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -137,11 +137,15 @@ class ExtendedOpenAIAgentEntity(
         # Call the LLM
 
         try:
-            await self._async_handle_chat_log(
-                chat_log,
-                function_tools=function_tools,
-                exposed_entities=exposed_entities,
-                llm_context=llm_context,
+            await retry_with_backoff(
+                lambda: self._async_handle_chat_log(
+                    chat_log,
+                    function_tools=function_tools,
+                    exposed_entities=exposed_entities,
+                    llm_context=llm_context,
+                ),
+                self.hass,
+                self.entry,
             )
         except OpenAIError as err:
             _LOGGER.error(err)

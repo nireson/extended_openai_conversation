@@ -2,22 +2,36 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable, Coroutine
 from functools import partial
 import logging
 import re
 from typing import Any
 
-from openai import AsyncAzureOpenAI, AsyncClient, AsyncOpenAI
+from openai import AsyncAzureOpenAI, AsyncClient, AsyncOpenAI, OpenAIError
+from openai._exceptions import APIConnectionError
 
 from homeassistant.components import conversation
 from homeassistant.components.homeassistant.exposed_entities import async_should_expose
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.template import Template
 
 from .const import (
+    CONF_API_PROVIDER,
+    CONF_API_VERSION,
+    CONF_BASE_URL,
+    CONF_ORGANIZATION,
+    DEFAULT_API_PROVIDER,
     DEFAULT_MODEL_CONFIG,
+    DEFAULT_RETRY_BACKOFF_FACTOR,
+    DEFAULT_RETRY_INITIAL_DELAY,
+    DEFAULT_RETRY_MAX_ATTEMPTS,
+    DEFAULT_RETRY_MAX_DELAY,
     DEFAULT_TOKEN_PARAM,
     MODEL_CONFIG_PATTERNS,
     MODEL_TOKEN_PARAMETER_SUPPORT,
@@ -163,3 +177,83 @@ async def get_authenticated_client(
     async for _ in response:
         break
     return client
+
+
+async def ensure_client_healthy(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> None:
+    """Ensure the OpenAI client is healthy, recreating if necessary.
+
+    Checks if the underlying httpx client is closed and recreates
+    the OpenAI client if needed, updating entry.runtime_data.
+    """
+    client: AsyncClient = entry.runtime_data
+    if hasattr(client, "is_closed") and callable(client.is_closed):
+        closed = client.is_closed()
+    elif hasattr(client, "_client") and hasattr(client._client, "is_closed"):
+        closed = client._client.is_closed
+    else:
+        closed = False
+
+    if closed:
+        _LOGGER.warning("OpenAI client connection is closed, recreating client")
+        new_client = await get_authenticated_client(
+            hass=hass,
+            api_key=entry.data[CONF_API_KEY],
+            base_url=entry.data.get(CONF_BASE_URL),
+            api_version=entry.data.get(CONF_API_VERSION),
+            organization=entry.data.get(CONF_ORGANIZATION),
+            skip_authentication=True,
+            api_provider=entry.data.get(CONF_API_PROVIDER, DEFAULT_API_PROVIDER),
+        )
+        entry.runtime_data = new_client
+
+
+async def retry_with_backoff(
+    coro_factory: Callable[[], Coroutine],
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    max_attempts: int = DEFAULT_RETRY_MAX_ATTEMPTS,
+    initial_delay: float = DEFAULT_RETRY_INITIAL_DELAY,
+    max_delay: float = DEFAULT_RETRY_MAX_DELAY,
+    backoff_factor: float = DEFAULT_RETRY_BACKOFF_FACTOR,
+) -> None:
+    """Execute an async callable with exponential backoff on OpenAI errors.
+
+    Before each retry, ensures the OpenAI client is healthy.
+    Raises the last OpenAIError if all attempts fail.
+    """
+    last_error: OpenAIError | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await ensure_client_healthy(hass, entry)
+            await coro_factory()
+            return
+        except OpenAIError as err:
+            last_error = err
+            if attempt < max_attempts:
+                delay = min(
+                    initial_delay * (backoff_factor ** (attempt - 1)),
+                    max_delay,
+                )
+                _LOGGER.warning(
+                    "OpenAI request attempt %d/%d failed (%s: %s), "
+                    "retrying in %.1fs",
+                    attempt,
+                    max_attempts,
+                    type(err).__name__,
+                    err,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                _LOGGER.error(
+                    "All %d OpenAI request attempts failed. Last error: %s",
+                    max_attempts,
+                    err,
+                )
+
+    if last_error is not None:
+        raise last_error

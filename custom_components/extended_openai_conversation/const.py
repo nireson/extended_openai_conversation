@@ -245,6 +245,12 @@ CONF_REASONING_EFFORT = "reasoning_effort"
 DEFAULT_REASONING_EFFORT = "low"
 REASONING_EFFORT_OPTIONS = ["low", "medium", "high"]
 
+# Connection retry settings
+DEFAULT_RETRY_MAX_ATTEMPTS = 3
+DEFAULT_RETRY_INITIAL_DELAY = 1.0  # seconds
+DEFAULT_RETRY_MAX_DELAY = 10.0  # seconds
+DEFAULT_RETRY_BACKOFF_FACTOR = 2.0
+
 SERVICE_QUERY_IMAGE = "query_image"
 
 CONF_PAYLOAD_TEMPLATE = "payload_template"

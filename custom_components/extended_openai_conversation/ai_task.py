@@ -6,6 +6,8 @@ from json import JSONDecodeError
 import logging
 from typing import TYPE_CHECKING
 
+from openai import OpenAIError
+
 from homeassistant.components import ai_task, conversation
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -14,6 +16,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util.json import json_loads
 
 from .entity import ExtendedOpenAIBaseLLMEntity
+from .helpers import retry_with_backoff
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigSubentry
@@ -63,14 +66,23 @@ class ExtendedOpenAITaskEntity(
         """Handle a generate data task."""
         # Call _async_handle_chat_log with empty custom_functions and exposed_entities
         # AI Task operates without functions
-        await self._async_handle_chat_log(
-            chat_log,
-            function_tools=[],
-            exposed_entities=[],
-            llm_context=None,
-            structure_name=task.name,
-            structure=task.structure,
-        )
+        try:
+            await retry_with_backoff(
+                lambda: self._async_handle_chat_log(
+                    chat_log,
+                    function_tools=[],
+                    exposed_entities=[],
+                    llm_context=None,
+                    structure_name=task.name,
+                    structure=task.structure,
+                ),
+                self.hass,
+                self.entry,
+            )
+        except OpenAIError as err:
+            raise HomeAssistantError(
+                f"Error communicating with OpenAI: {err}"
+            ) from err
 
         # Extract response
         if not isinstance(chat_log.content[-1], conversation.AssistantContent):
