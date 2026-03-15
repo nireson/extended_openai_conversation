@@ -227,14 +227,25 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
         # them to the tools list.  YAML-defined tools take priority: if a YAML
         # tool and an LLM API tool share the same name, the LLM API tool is
         # skipped.  Tool execution is routed in the dispatch loop below.
+        #
+        # The system prompt is saved and restored before discovery because
+        # _discover_llm_api_tools appends api_prompt text to it.  If the
+        # caller retries (via retry_with_backoff), this method runs again
+        # and we must not accumulate duplicate prompts.
         llm_api_tools: dict[str, llm.Tool] = {}
         yaml_tool_names = {f["spec"]["name"] for f in function_tools}
+        original_system_content = chat_log.content[0].content
 
         try:
             llm_api_tools = await self._discover_llm_api_tools(
                 chat_log, tools, yaml_tool_names, llm_context,
             )
         except Exception:
+            # Restore the system prompt on failure so it is not left in a
+            # partially modified state.
+            chat_log.content[0] = conversation.SystemContent(
+                content=original_system_content
+            )
             _LOGGER.warning(
                 "Failed to discover LLM API tools, continuing without them",
                 exc_info=True,

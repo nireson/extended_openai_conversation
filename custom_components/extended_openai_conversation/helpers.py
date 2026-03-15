@@ -10,6 +10,12 @@ import re
 from typing import Any
 
 from openai import AsyncAzureOpenAI, AsyncClient, AsyncOpenAI, OpenAIError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 
 from homeassistant.components import conversation
 from homeassistant.components.homeassistant.exposed_entities import async_should_expose
@@ -229,21 +235,35 @@ async def retry_with_backoff(
     max_delay: float = DEFAULT_RETRY_MAX_DELAY,
     backoff_factor: float = DEFAULT_RETRY_BACKOFF_FACTOR,
 ) -> None:
-    """Execute an async operation with exponential backoff on OpenAI errors.
+    """Execute an async operation with exponential backoff on transient errors.
 
     Wraps a coroutine factory (a zero-argument callable that returns a
-    coroutine) and retries it on ``OpenAIError`` with increasing delays.
+    coroutine) and retries it on *transient* ``OpenAIError`` subclasses
+    (connection errors, timeouts, server errors, rate limits).  Non-transient
+    errors such as ``AuthenticationError``, ``BadRequestError``, and
+    ``PermissionDeniedError`` are raised immediately since retrying them
+    is pointless.
+
     Before each attempt the client health is verified via
     :func:`ensure_client_healthy`.
 
     The default schedule (3 attempts with delays of 1 s, 2 s) adds no
     latency to successful requests — the retry path only activates on
-    failure. Combined with the OpenAI SDK's own internal retries (3
+    failure.  Combined with the OpenAI SDK's own internal retries (3
     attempts with sub-second backoff), this provides up to 9 HTTP-level
     attempts over ~15 seconds, covering typical server restart windows.
 
     Raises the last ``OpenAIError`` if all attempts are exhausted.
     """
+    # Only these error types are worth retrying — they indicate transient
+    # infrastructure problems rather than permanent request issues.
+    _RETRYABLE_ERRORS = (
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
+
     last_error: OpenAIError | None = None
 
     for attempt in range(1, max_attempts + 1):
@@ -251,7 +271,7 @@ async def retry_with_backoff(
             await ensure_client_healthy(hass, entry)
             await coro_factory()
             return
-        except OpenAIError as err:
+        except _RETRYABLE_ERRORS as err:
             last_error = err
             if attempt < max_attempts:
                 delay = min(
@@ -274,6 +294,10 @@ async def retry_with_backoff(
                     max_attempts,
                     err,
                 )
+        except OpenAIError:
+            # Non-transient errors (AuthenticationError, BadRequestError,
+            # PermissionDeniedError, NotFoundError, etc.) — fail immediately.
+            raise
 
     if last_error is not None:
         raise last_error
